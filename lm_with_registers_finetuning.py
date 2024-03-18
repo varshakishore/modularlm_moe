@@ -24,6 +24,7 @@ from tqdm.auto import tqdm
 from transformers import get_scheduler, AutoTokenizer, PreTrainedTokenizerBase, GPT2Model, GPT2LMHeadModel
 from transformers import PreTrainedTokenizerBase, default_data_collator
 from datasets import load_dataset
+from datasets.arrow_dataset import Dataset
 from model.registers_gpt import GPT2LMHeadModelWithRegisters
 
 from accelerate import Accelerator
@@ -92,7 +93,7 @@ def get_output_dir(args):
     print(f'Created {output_dir}')
     return output_dir
 
-def get_dataloader(dataset, tokenizer, registers, batch_size, max_seq_len, mode='language_modeling', shuffle=False, registers=False):
+def get_dataloader(dataset, tokenizer, batch_size, max_seq_len, mode='language_modeling', shuffle=False, registers=None):
     assert mode in {'language_modeling'}
 
     def tokenization(example):
@@ -100,7 +101,7 @@ def get_dataloader(dataset, tokenizer, registers, batch_size, max_seq_len, mode=
             text = tokenizer.bos_token + example['document_chunk'] + tokenizer.eos_token
             tokenized_text = tokenizer(text, padding="max_length", truncation=True, max_length=max_seq_len, return_tensors='pt')
             tokenized_text['input_ids'] = tokenized_text['input_ids'].squeeze()
-            if registers:
+            if registers is not None:
                 tokenized_text['register_ids'] = torch.tensor([registers.get_id(example['document_title'])], dtype=torch.int64)
             tokenized_text['attention_mask'] = tokenized_text['attention_mask'].squeeze()
             tokenized_text['labels'] = tokenized_text['input_ids'].clone()
@@ -197,8 +198,10 @@ class Trainer(object):
         )
 
         # self.dataset = dataset.shuffle(seed=seed)
-
-        self.dataloader = get_dataloader(self.dataset['train'], self.tokenizer, train_batch_size, self.max_seq_len, shuffle=True, registers=self.registers)
+        if self.registers:
+            self.dataloader = get_dataloader(self.dataset, self.tokenizer, train_batch_size, self.max_seq_len, shuffle=True, registers=self.lm.transformer.registers)
+        else:
+            self.dataloader = get_dataloader(self.dataset, self.tokenizer, train_batch_size, self.max_seq_len, shuffle=True, registers=None)
 
         # optimizer
 
@@ -458,7 +461,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume_training", action="store_true", default=False)
     parser.add_argument("--resume_dir", type=str, default=None)
     parser.add_argument("--registers", action="store_true", default=False)
-    parser.add_argument("--n_registers_per_document", type=int, default=4)
+    parser.add_argument("--n_registers_per_document", type=int, default=8)
 
     args = parser.parse_args()
 
