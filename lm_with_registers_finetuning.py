@@ -125,7 +125,6 @@ class Trainer(object):
         dataset_path,
         *,
         train_batch_size = 16,
-        eval_batch_size = 64,
         max_seq_len = 128,
         train_lr = 1e-4,
         train_num_steps = 100000,
@@ -139,7 +138,6 @@ class Trainer(object):
         amp = False,
         split_batches = True,
         seed=42,
-        registers=False,
         n_registers_per_document=4,
     ):
         super().__init__()
@@ -151,7 +149,6 @@ class Trainer(object):
 
         self.best_val_metric = 0
         self.num_samples = num_samples
-        self.registers = registers
         self.n_registers_per_document = n_registers_per_document
 
         self.accelerator = Accelerator(
@@ -168,7 +165,7 @@ class Trainer(object):
                 self.accelerator.init_trackers(run, config=args, init_kwargs={"wandb": {"dir": results_folder}})
 
         self.accelerator.native_amp = amp
-        if not self.registers:
+        if self.n_registers_per_document <= 0:
             self.lm = GPT2LMHeadModel.from_pretrained('gpt2')
         else:
             self.lm = GPT2LMHeadModelWithRegisters.from_pretrained('gpt2')
@@ -179,7 +176,7 @@ class Trainer(object):
         num_added_tokens = self.tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
         assert num_added_tokens == 1
         self.lm.resize_token_embeddings(len(self.tokenizer))
-        if self.registers:
+        if self.n_registers_per_document > 0:
             with open(os.path.join(dataset_path, 'natural_questions_train_document_titles.json'), 'r') as infile:
                 train_document_titles = json.load(infile)
             self.lm.transformer.initialize_registers(train_document_titles, self.n_registers_per_document)
@@ -187,7 +184,6 @@ class Trainer(object):
         self.eval_every = eval_every
 
         self.train_batch_size = train_batch_size
-        self.eval_batch_size = eval_batch_size
 
         self.train_num_steps = train_num_steps
         self.max_seq_len = max_seq_len
@@ -198,7 +194,7 @@ class Trainer(object):
         )
 
         # self.dataset = dataset.shuffle(seed=seed)
-        if self.registers:
+        if self.n_registers_per_document > 0:
             self.dataloader = get_dataloader(self.dataset, self.tokenizer, train_batch_size, self.max_seq_len, shuffle=True, registers=self.lm.transformer.registers)
         else:
             self.dataloader = get_dataloader(self.dataset, self.tokenizer, train_batch_size, self.max_seq_len, shuffle=True, registers=None)
@@ -260,91 +256,6 @@ class Trainer(object):
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
 
-    @torch.no_grad()
-    def validation(self, num_samples=None, test=False, timing=False, seed=42):
-        num_samples = default(num_samples, self.num_samples)
-        self.lm.eval()
-        device = self.accelerator.device
-        accelerator = self.accelerator
-        # Extract references
-        reference_texts = {}
-        if test:
-            reference_texts['test'] = self.dataset['test']['text'][:num_samples]
-        else:
-            reference_texts['val'] = self.dataset['valid']['text'][:num_samples]
-        reference_texts['train'] = self.dataset['train']['text'][:num_samples]
-
-        torch.manual_seed(seed)
-        generate_kwargs = {
-            'nucleus_95':
-            {'max_length':self.max_seq_len, 'min_length':5, 'do_sample':True, 'top_p':.95, 'num_beams':1, 'no_repeat_ngram_size':3, 'repetition_penalty':1.2},}
-
-        # Stores generation outputs for each strategy
-        all_texts_lists = {k:[] for k,_ in generate_kwargs.items()}  
-        # Loop until enough senetences have been generated across all strategies
-        input_prompt = self.tokenizer.bos_token
-        tokenized_prompt = self.tokenizer(input_prompt, return_tensors="pt")
-        input_ids = tokenized_prompt.input_ids.to(device)
-        attention_mask = tokenized_prompt.attention_mask.to(device)
-        if timing:
-            start = timeit.default_timer()
-        for k in  all_texts_lists.keys():
-            print(f'Sampling strategy {k}')
-            while len(all_texts_lists[k]) < num_samples:
-                batches = num_to_groups(num_samples-len(all_texts_lists[k]), self.eval_batch_size)
-                for batch in batches:
-                    batch_input_ids = repeat(input_ids, '1 1 -> b 1', b=batch)
-                    batch_attention_mask = repeat(attention_mask, '1 1 -> b 1', b=batch)
-                    sample_ids = self.lm.generate(input_ids=batch_input_ids, attention_mask=batch_attention_mask, pad_token_id=self.tokenizer.pad_token_id, **generate_kwargs[k])
-                    texts_list = [self.tokenizer.decode(g, skip_special_tokens=True, clean_up_tokenization_spaces=True) for g in sample_ids]
-                    all_texts_lists[k].extend([text.strip() for text in texts_list if len(text.strip())>0])
-                    # Exit early for beam search
-                    if k == 'beam':
-                        all_texts_lists[k] = [all_texts_lists[k][0]]*num_samples
-                        break
-        if timing:
-            end = timeit.default_timer()
-            wandb.run.summary[f"{num_samples}samples_time"] = end-start
-            return
-            
-        assert min([len(all_texts_lists[ele]) for ele in all_texts_lists]) >= num_samples
-        text_generations = {k:v[:num_samples] for k,v in all_texts_lists.items()} 
-
-        metrics = {}
-
-        self.lm.to('cpu')
-        torch.cuda.empty_cache() 
-        for strategy, all_texts_list in text_generations.items():
-            metrics[f"model/{strategy}/perplexity"] = evaluation.compute_perplexity(all_texts_list)
-            metrics[f"model/{strategy}/unique_wordcount"] = evaluation.compute_wordcount(all_texts_list)
-            ngram_metrics = evaluation.compute_diversity(all_texts_list)
-            for k, v in ngram_metrics.items():
-                metrics[f"model/{strategy}/{k}"] = v
-            metrics[f"model/{strategy}/memorization"] = evaluation.compute_memorization(all_texts_list, self.dataset['train']['text'])
-            table = wandb.Table( 
-                columns=['Samples'], data=[[text] for text in all_texts_list])
-            accelerator.log({f"model/{strategy}/samples": table}, self.step)
-
-            # Only evaluate MAUVE if generations are reasonable
-            if metrics[f"model/{strategy}/perplexity"] > 5000:
-                continue
-
-            for mauve_model_id in ["gpt2-large"]:
-                for key, reference_text in reference_texts.items():
-                    metrics[f"model/{strategy}/{mauve_model_id}_{key}_mauve"], _ = evaluation.compute_mauve(all_texts_list, reference_text, mauve_model_id)
-
-        if test:
-            metrics_dict = {**metrics,**self.reference_dict}
-            metrics_dict = {f'{k}_seed{seed}':v for k,v in metrics_dict.items()}
-            accelerator.log(metrics_dict, self.step)
-            print(metrics_dict)
-        else:
-            accelerator.log({**metrics}, self.step)
-        torch.cuda.empty_cache() 
-        self.lm.to(device)
-        
-        self.lm.train()
-
     def train(self):
         self.lm.train()
         accelerator = self.accelerator
@@ -387,7 +298,6 @@ class Trainer(object):
 
 
                     if self.step % self.eval_every == 0:
-                        # self.validation()
                         self.save()
                         self.lm.train() 
 
@@ -401,7 +311,6 @@ def main(args):
         dataset_path=args.dataset_path,
         num_samples=args.num_samples,
         train_batch_size = args.train_batch_size,
-        eval_batch_size = args.eval_batch_size,
         max_seq_len = args.max_seq_len,
         train_lr = args.learning_rate,
         train_num_steps = args.num_train_steps,
@@ -412,20 +321,8 @@ def main(args):
         eval_every = args.eval_every,
         results_folder = args.output_dir,
         amp = args.amp,
-        registers = args.registers,
         n_registers_per_document = args.n_registers_per_document,
     )
-
-    if args.eval:
-        trainer.load(args.resume_dir)
-        trainer.validation(args.num_samples)
-        return
-    if args.eval_test:
-        trainer.load(args.resume_dir)
-        for seed in [42, 43, 44, 45, 46]:
-            trainer.dataset = trainer.dataset.shuffle(seed)
-            trainer.validation(args.num_samples, seed=seed, test=True)
-        return
     if args.resume_training:
         trainer.load(args.resume_dir)
 
@@ -440,7 +337,6 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_name", type=str, default=None)
     # Optimization hyperparameters
     parser.add_argument("--train_batch_size", type=int, default=32)
-    parser.add_argument("--eval_batch_size", type=int, default=32)
     parser.add_argument("--num_train_steps", type=int, default=10000)
     parser.add_argument("--max_seq_len", type=int, default=128)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
@@ -455,24 +351,18 @@ if __name__ == "__main__":
     # Accelerate arguments
     parser.add_argument("--amp", action="store_true", default=False)
     # Load and eval model
-    parser.add_argument("--eval", action="store_true", default=False)
-    parser.add_argument("--eval_test", action="store_true", default=False)
     parser.add_argument("--timing", action="store_true", default=False)
     parser.add_argument("--resume_training", action="store_true", default=False)
     parser.add_argument("--resume_dir", type=str, default=None)
-    parser.add_argument("--registers", action="store_true", default=False)
     parser.add_argument("--n_registers_per_document", type=int, default=8)
 
     args = parser.parse_args()
 
-    if args.eval or args.resume_training or args.eval_test:
+    if args.resume_training:
         with open(os.path.join(args.resume_dir, 'args.json'), 'rt') as f:
             saved_args = json.load(f)
         args_dict = vars(args)
-        if args.eval or args.eval_test:
-            heldout_params = {'wandb_name', 'output_dir', 'resume_dir', 'eval', 'eval_test', 'ddim_sampling_eta', 'num_samples', 'sampling_timesteps'}
-        else:
-            heldout_params = {'output_dir', 'resume_dir', 'resume_training', 'ddim_sampling_eta', 'num_samples', 'sampling_timesteps', 'save_and_sample_every'}
+        heldout_params = {'output_dir', 'resume_dir', 'resume_training', 'ddim_sampling_eta', 'num_samples', 'sampling_timesteps', 'save_and_sample_every'}
         for k,v in saved_args.items():
             if k in heldout_params:
                 continue
