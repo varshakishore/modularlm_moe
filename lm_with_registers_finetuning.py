@@ -109,6 +109,7 @@ def get_dataloader(dataset, tokenizer, batch_size, max_seq_len, mode='language_m
             return tokenized_text
 
     columns = list(dataset.features) # Changed for robustness
+    print("Mapping Tokenization")
     dataset = dataset.map(tokenization, remove_columns=columns)
     return DataLoader(
             dataset,
@@ -166,11 +167,14 @@ class Trainer(object):
 
         self.accelerator.native_amp = amp
         if self.n_registers_per_document <= 0:
+            print("Initializing GPT2LMHeadModel")
             self.lm = GPT2LMHeadModel.from_pretrained('gpt2')
         else:
+            print("Initializing GPT2LMHeadModelWithRegisters")
             self.lm = GPT2LMHeadModelWithRegisters.from_pretrained('gpt2')
 
         # reset seeds after model initialization
+        print("Initializing Tokenizer")
         set_seeds(seed+1)
         self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained("gpt2")
         num_added_tokens = self.tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
@@ -189,22 +193,27 @@ class Trainer(object):
         self.max_seq_len = max_seq_len
         
         # dataset and dataloader
+        print("Initializing Dataset")
         self.dataset = Dataset.load_from_disk(
             os.path.join(dataset_path, "natural_questions_train_chunked_documents")
         )
 
         # self.dataset = dataset.shuffle(seed=seed)
         if self.n_registers_per_document > 0:
+            print("Initializing Registers DataLoader")
             self.dataloader = get_dataloader(self.dataset, self.tokenizer, train_batch_size, self.max_seq_len, shuffle=True, registers=self.lm.transformer.registers)
         else:
+            print("Initializing DataLoader")
             self.dataloader = get_dataloader(self.dataset, self.tokenizer, train_batch_size, self.max_seq_len, shuffle=True, registers=None)
 
         # optimizer
 
+        print("Initializing Optimizer")
         self.opt = get_adamw_optimizer(self.lm.parameters(), lr = train_lr, betas = adam_betas, weight_decay=adam_weight_decay)
 
         # scheduler
 
+        print("Initializing Scheduler")
         lr_scheduler = get_scheduler(
             lr_schedule,
             optimizer=self.opt,
