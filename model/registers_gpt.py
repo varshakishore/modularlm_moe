@@ -169,7 +169,11 @@ class GPT2ModelWithRegisters(GPT2Model):
 
         if register_ids is not None and attention_mask is not None:
             attention_mask = torch.cat([
-                torch.ones(attention_mask.size(0), self.registers.n_registers_per_document),
+                torch.ones(
+                    attention_mask.size(0),
+                    self.registers.n_registers_per_document,
+                    device=attention_mask.device
+                ),
                 attention_mask
             ], dim=1)
 
