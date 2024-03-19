@@ -354,7 +354,7 @@ if __name__ == "__main__":
     parser.add_argument("--timing", action="store_true", default=False)
     parser.add_argument("--resume_training", action="store_true", default=False)
     parser.add_argument("--resume_dir", type=str, default=None)
-    parser.add_argument("--n_registers_per_document", type=int, default=8)
+    parser.add_argument("--n_registers_per_document", type=int, required=True)
 
     args = parser.parse_args()
 
