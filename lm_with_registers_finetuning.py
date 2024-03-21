@@ -19,6 +19,7 @@ from einops.layers.torch import Rearrange
 from collections import defaultdict
 
 import json
+import itertools
 from tqdm.auto import tqdm
 
 from transformers import get_scheduler, AutoTokenizer, PreTrainedTokenizerBase, GPT2Model, GPT2LMHeadModel
@@ -68,6 +69,20 @@ def separate_weight_decayable_params(params):
     wd_params = [param for param in params if param not in set(no_wd_params)]
     return wd_params, no_wd_params
 
+# def separate_params(named_params):
+#     # Exclude affine params in norms (e.g. LayerNorm, GroupNorm, etc.) and bias terms
+#     no_wd_params = []
+#     wd_params = []
+#     reg_params = []
+#     for name, param in named_params:
+#         if param.ndim < 2:
+#             no_wd_params.append(param)
+#         elif 'registers' not in name:
+#             wd_params.append(param)
+#         else:
+#             reg_params.append(param)
+#     return wd_params, no_wd_params, reg_params
+
 def get_adamw_optimizer(params, lr, betas, weight_decay, eps=1e-8):
     params = list(params)
     wd_params, no_wd_params = separate_weight_decayable_params(params)
@@ -78,6 +93,17 @@ def get_adamw_optimizer(params, lr, betas, weight_decay, eps=1e-8):
     ]
 
     return AdamW(param_groups, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps)
+
+# def get_optimizer(named_params, lr, betas, weight_decay, eps=1e-8):
+#     wd_params, no_wd_params, reg_params = separate_params(list(named_params))
+
+#     param_groups = [
+#         {'params': wd_params},
+#         {'params': no_wd_params, 'weight_decay': 0},
+#         {'params': reg_params, 'lr': 1000*lr},
+#     ]
+
+#     return AdamW(param_groups, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps)
 
 def compute_grad_norm(parameters):
     # implementation adapted from https://pytorch.org/docs/stable/_modules/torch/nn/utils/clip_grad.html#clip_grad_norm_
@@ -126,8 +152,10 @@ class Trainer(object):
         dataset_path,
         *,
         train_batch_size = 16,
+        val_batch_size = 64,
         max_seq_len = 128,
         train_lr = 1e-4,
+        pretrain_num_steps = 0,
         train_num_steps = 100000,
         lr_schedule = 'cosine',
         num_warmup_steps = 500,
@@ -139,10 +167,9 @@ class Trainer(object):
         amp = False,
         split_batches = True,
         seed=42,
-        n_registers_per_document=4,
+        n_registers_per_document=0,
     ):
         super().__init__()
-
 
         set_seeds(seed)
 
@@ -188,7 +215,9 @@ class Trainer(object):
         self.eval_every = eval_every
 
         self.train_batch_size = train_batch_size
+        self.val_batch_size = val_batch_size
 
+        self.pretrain_num_steps = pretrain_num_steps
         self.train_num_steps = train_num_steps
         self.max_seq_len = max_seq_len
         
@@ -197,7 +226,14 @@ class Trainer(object):
         self.dataset = Dataset.load_from_disk(
             os.path.join(dataset_path, "natural_questions_train_chunked_documents")
         )
-
+        with open(os.path.join(dataset_path, 'natural_questions_train_document_subset_indices.json'), 'r') as infile:
+            subset_documents_indices = json.load(infile)
+        document_subset_indices = list(itertools.chain.from_iterable(list(subset_documents_indices.values())))
+        self.dataset = self.dataset.select(document_subset_indices)
+        self.val_dataset = Dataset.load_from_disk(
+            os.path.join(dataset_path, "natural_questions_validation_chunked_documents")
+        )
+        self.val_dataset = self.val_dataset.select(torch.randperm(512, generator=torch.Generator().manual_seed(42)))
         # self.dataset = dataset.shuffle(seed=seed)
         if self.n_registers_per_document > 0:
             print("Initializing Registers DataLoader")
@@ -205,39 +241,31 @@ class Trainer(object):
         else:
             print("Initializing DataLoader")
             self.dataloader = get_dataloader(self.dataset, self.tokenizer, train_batch_size, self.max_seq_len, shuffle=True, registers=None)
+        self.val_dataloader = get_dataloader(self.val_dataset, self.tokenizer, val_batch_size, self.max_seq_len, shuffle=True, registers=None)
 
-        # optimizer
+        # save optimizer parameters
+        self.train_lr = train_lr
+        self.adam_betas = adam_betas
+        self.adam_weight_decay = adam_weight_decay
 
-        print("Initializing Optimizer")
-        self.opt = get_adamw_optimizer(self.lm.parameters(), lr = train_lr, betas = adam_betas, weight_decay=adam_weight_decay)
-
-        # scheduler
-
-        print("Initializing Scheduler")
-        lr_scheduler = get_scheduler(
-            lr_schedule,
-            optimizer=self.opt,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=train_num_steps,
-        )
+        self.lr_schedule = lr_schedule
+        self.num_warmup_steps = num_warmup_steps
+        self.train_num_steps = train_num_steps
 
         # for logging results in a folder periodically
-
         if self.accelerator.is_main_process:
             self.results_folder = Path(results_folder)
             self.results_folder.mkdir(exist_ok = True)
 
         # step counter state
-
         self.step = 0
 
-        # prepare model, dataloader, optimizer with accelerator
-
-        self.lm, self.opt, self.dataloader, self.lr_scheduler = self.accelerator.prepare(self.lm, self.opt, self.dataloader, lr_scheduler)
+        # prepare model, dataloader with accelerator
+        self.lm, self.dataloader, self.val_dataloader = self.accelerator.prepare(self.lm, self.dataloader, self.val_dataloader)
         self.data_iter = cycle(self.dataloader)
         self.reference_dict = {}
 
-    def save(self):
+    def save(self, name):
         if not self.accelerator.is_local_main_process:
             return
 
@@ -248,7 +276,7 @@ class Trainer(object):
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
         }
 
-        torch.save(data, str(self.results_folder / f'model.pt'))
+        torch.save(data, str(self.results_folder / name))
 
     def load(self, file_path=None):
         file_path = Path(file_path) if exists(file_path) else self.results_folder
@@ -265,14 +293,48 @@ class Trainer(object):
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
 
-    def train(self):
+    @torch.no_grad
+    def validate(self):
+        self.lm.eval()
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        for data in tqdm(self.val_dataloader):
+            total_loss = 0.
+
+            data = {k:v.to(device) for k,v in next(self.data_iter).items()}
+            with self.accelerator.autocast():
+                loss = self.lm(**data).loss
+                total_loss += loss.item()
+
+        accelerator.wait_for_everyone()
+
+        if accelerator.is_main_process:
+            # Log to WandB
+            total_loss = total_loss / len(self.val_dataloader)
+            logs = {"validation/loss": total_loss}
+            accelerator.log(logs, step=self.step)
+
+        self.lm.train()
+
+    def pretrain(self):
+        # optimizer
+        print("Initializing Optimizer")
+        self.opt = AdamW(
+            self.lm.transformer.registers.parameters(),
+            lr = self.train_lr, betas = self.adam_betas,
+            weight_decay=self.adam_weight_decay
+        )
+
+        self.opt = self.accelerator.prepare(self.opt)
+
         self.lm.train()
         accelerator = self.accelerator
         device = accelerator.device
 
-        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+        with tqdm(initial = self.step, total = self.pretrain_num_steps, disable = not accelerator.is_main_process) as pbar:
 
-            while self.step < self.train_num_steps:
+            while self.step < self.pretrain_num_steps:
 
                 total_loss = 0.
 
@@ -285,6 +347,60 @@ class Trainer(object):
 
                     self.accelerator.backward(loss)
 
+                accelerator.wait_for_everyone()
+
+                grad_norm = compute_grad_norm(self.lm.transformer.registers.parameters())
+
+                accelerator.clip_grad_norm_(self.lm.transformer.registers.parameters(), 1.0)
+                self.opt.step()
+                self.opt.zero_grad()
+
+                accelerator.wait_for_everyone()
+
+                self.step += 1
+                if accelerator.is_main_process:
+                    # Log to WandB
+                    logs = {"loss": total_loss, "grad_norm": grad_norm, "lr": self.train_lr, "step": self.step, "epoch": (self.step)/len(self.dataloader), "samples": self.step*self.train_batch_size}
+                    accelerator.log(logs, step=self.step)
+
+                pbar.update(1)
+
+        self.save(f'model{self.step}.pt')
+        accelerator.print('pretraining complete')
+
+    def train(self):
+        # optimizer
+        self.accelerator.print("Initializing Optimizer")
+        self.opt = get_adamw_optimizer(self.lm.parameters(), lr = self.train_lr, betas = self.adam_betas, weight_decay=self.adam_weight_decay)
+
+        # scheduler
+        self.accelerator.print("Initializing Scheduler")
+        self.lr_scheduler = get_scheduler(
+            self.lr_schedule,
+            optimizer=self.opt,
+            num_warmup_steps=self.num_warmup_steps,
+            num_training_steps=self.train_num_steps,
+        )
+        self.opt, self.lr_scheduler = self.accelerator.prepare(self.opt, self.lr_scheduler)
+
+        self.lm.train()
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+
+            while self.step < self.train_num_steps + self.pretrain_num_steps:
+
+                total_loss = 0.
+
+                data = {k:v.to(device) for k,v in next(self.data_iter).items()}
+
+                with self.accelerator.autocast():
+                    loss = self.lm(**data).loss
+                    loss = loss
+                    total_loss += loss.item()
+
+                    self.accelerator.backward(loss)
 
                 accelerator.wait_for_everyone()
 
@@ -305,9 +421,9 @@ class Trainer(object):
 
                     accelerator.log(logs, step=self.step)
 
-
                     if self.step % self.eval_every == 0:
-                        self.save()
+                        self.validate()
+                        self.save(f'model{self.step}.pt')
                         self.lm.train() 
 
                 pbar.update(1)
@@ -322,6 +438,7 @@ def main(args):
         train_batch_size = args.train_batch_size,
         max_seq_len = args.max_seq_len,
         train_lr = args.learning_rate,
+        pretrain_num_steps = args.num_pretrain_steps,
         train_num_steps = args.num_train_steps,
         lr_schedule = args.lr_schedule,
         num_warmup_steps = args.lr_warmup_steps,
@@ -335,6 +452,8 @@ def main(args):
     if args.resume_training:
         trainer.load(args.resume_dir)
 
+    if args.n_registers_per_document > 0 and args.num_pretrain_steps > 0:
+        trainer.pretrain()
     trainer.train()
 
 if __name__ == "__main__":
@@ -346,6 +465,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_name", type=str, default=None)
     # Optimization hyperparameters
     parser.add_argument("--train_batch_size", type=int, default=32)
+    parser.add_argument("--val_batch_size", type=int, default=128)
+    parser.add_argument("--num_pretrain_steps", type=int, default=0)
     parser.add_argument("--num_train_steps", type=int, default=10000)
     parser.add_argument("--max_seq_len", type=int, default=128)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
